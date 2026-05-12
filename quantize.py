@@ -46,6 +46,11 @@ def quantize_int8_blockwise(
         qweight : int8   tensor  [N, K]          — quantized weights
         scales  : float16 tensor [N, K // BLOCK]  — per-block scales
     """
+    # Flatten any extra dims into K so quantization always operates on [N, K].
+    # e.g. a Conv weight [C_out, C_in, kH, kW] becomes [C_out, C_in*kH*kW].
+    if weight.dim() > 2:
+        weight = weight.view(weight.shape[0], -1)
+
     N, K = weight.shape
     assert K % BLOCK == 0, (
         f"Weight K-dim ({K}) must be divisible by BLOCK ({BLOCK}). "
