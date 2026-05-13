@@ -36,7 +36,12 @@ LAYERS_FILE   = "layers_to_quantize.txt"
 # Quantisation mode — choose one:
 #   "mixed"    : outliers stored as float16 + bitmask per block (MixedQuantLinear)
 #   "pure_int8": 1 float16 scale + 64 int8 values per block, no outlier tracking (PureInt8Linear)
-QUANT_MODE    = "mixed"
+QUANT_MODE       = "mixed"
+
+# ── Inference speed-ups ───────────────────────────────────────────────────────
+USE_COMPILE      = True      # Plan B: wrap hot paths with torch.compile
+COMPILE_MODE     = "default" # "default" | "reduce-overhead" | "max-autotune"
+USE_FUSED_MATMUL = True      # Plan C: fused block matmul for PureInt8Linear
 
 
 # ── Data structure ────────────────────────────────────────────────────────────
@@ -293,6 +298,52 @@ def dequantize_int8_block(
     return w_fp16.reshape(N, -1)[:, :original_numel // N].reshape(original_shape)
 
 
+def _int8_fused_matmul(
+    x: torch.Tensor,
+    qweight: torch.Tensor,
+    scales: torch.Tensor,
+    bias,
+) -> torch.Tensor:
+    """
+    Plan C — block-by-block fused dequant + matmul.
+
+    Reshapes both x and the weight into [*, num_blocks, BLOCK_SIZE] and
+    computes a single einsum, so TorchInductor can fuse the scale multiply
+    directly into the GEMM without ever allocating a full [N, K_pad] fp16
+    weight tensor.
+
+    qweight : [N, K_pad]               int8
+    scales  : [N, K_pad // BLOCK_SIZE] float16
+    x       : [..., K_input]           any float dtype
+    """
+    N, K_pad   = qweight.shape
+    num_blocks = K_pad // BLOCK_SIZE
+
+    x_shape = x.shape
+    x_flat  = x.reshape(-1, x_shape[-1]).to(torch.float16)  # [B, K_input]
+    batch   = x_flat.shape[0]
+
+    k_in = x_flat.shape[1]
+    if k_in < K_pad:
+        x_flat = F.pad(x_flat, (0, K_pad - k_in))
+    elif k_in > K_pad:
+        x_flat = x_flat[:, :K_pad]
+
+    x_blocked = x_flat.view(batch, num_blocks, BLOCK_SIZE)          # [B, nb, S]
+    w_blocked = (
+        qweight.view(N, num_blocks, BLOCK_SIZE).to(torch.float16)
+        * scales.unsqueeze(2)
+    )                                                                # [N, nb, S]
+
+    # out[i, n] = Σ_b Σ_k  x[i,b,k] * w[n,b,k]  — fused by the compiler
+    out = torch.einsum("ibk,nbk->in", x_blocked, w_blocked)        # [B, N]
+
+    out = out.reshape(*x_shape[:-1], N)
+    if bias is not None:
+        out = out + bias.to(torch.float16)
+    return out
+
+
 class PureInt8Linear(nn.Module):
     """
     Drop-in replacement for nn.Linear — pure int8 block storage, no bitmask.
@@ -323,7 +374,9 @@ class PureInt8Linear(nn.Module):
         self.out_features = linear.out_features
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Dequantise weights to float16 then run original linear forward.
+        if USE_FUSED_MATMUL:
+            bias = self.bias.to(torch.float16) if self.bias is not None else None
+            return _int8_fused_matmul(x, self.qweight, self.scales, bias)
         weight = dequantize_int8_block(self.qweight, self.scales, self._weight_shape)
         bias   = self.bias.to(weight.dtype) if self.bias is not None else None
         return F.linear(x.to(weight.dtype), weight, bias)
@@ -396,6 +449,17 @@ def count_layers(model: nn.Module) -> tuple[int, int]:
             if isinstance(m, (MixedQuantLinear, PureInt8Linear)):
                 quant += 1
     return quant, total
+
+
+# ── Plan B — torch.compile hot paths ─────────────────────────────────────────
+# Replaces the module-level names so every forward call uses compiled versions.
+# First call per layer triggers JIT compilation (warm-up); subsequent calls are
+# faster. Remove or set USE_COMPILE = False to disable.
+if USE_COMPILE:
+    _c = lambda f: torch.compile(f, mode=COMPILE_MODE)
+    dequantize_mixed      = _c(dequantize_mixed)
+    dequantize_int8_block = _c(dequantize_int8_block)
+    _int8_fused_matmul    = _c(_int8_fused_matmul)
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
