@@ -1,104 +1,202 @@
 """
-LLaMA 3B  —  Int8 Blockwise Quantization
-=========================================
-Every nn.Linear (except lm_head) is quantized to int8 with one float16
-scale per 64-weight block.  At inference time we dequantize one block at
-a time and accumulate partial matmuls — K//64 Python iterations per layer
-instead of the naive N * K//64.
+LLaMA/Qwen  —  Mixed INT8/FP16 Block Quantization with Outlier Bitmask
+=======================================================================
+Within each block of BLOCK_SIZE values:
+  - Outlier values (|x − μ| > OUTLIER_SIGMA · σ) are kept as float16.
+  - The rest are quantised to int8 with one float16 scale per block.
+  - A 64-bit bitmask records which positions are float16 (bit i = 1 → pos i
+    is float16; LSB = position 0).
 
-Requirements:
-    pip install torch transformers accelerate
+Storage layout per block (CUDA-kernel friendly, CSR-style):
+  bitmask      : int64   — 1 value per block
+  scale        : float16 — 1 value per block
+  int8_data    : int8[]  — packed, position-ascending, contiguous across blocks
+  fp16_data    : float16[] — same ordering convention
+  int8_offsets : int32[] — CSR prefix-sum of int8 counts  (len = num_blocks+1)
+  fp16_offsets : int32[] — CSR prefix-sum of float16 counts (len = num_blocks+1)
 
-HuggingFace access:
-    The model is gated. Accept the licence at
-    https://huggingface.co/meta-llama/Llama-3.2-3B
-    then run:  huggingface-cli login
+Only layers listed in LAYERS_FILE are quantised; every other layer is unchanged.
 """
 
 import time
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
+from dataclasses import dataclass
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 
 # ── Config ────────────────────────────────────────────────────────────────────
+MODEL_ID      = "Qwen/Qwen2.5-1.5B-Instruct"
+BLOCK_SIZE    = 64       # values per quantisation block  ← tweak here
+OUTLIER_SIGMA = 3.0      # positions beyond this many σ are kept as float16 (mixed mode only)
+MAX_NEW       = 50
+LAYERS_FILE   = "layers_to_quantize.txt"
 
-MODEL_ID  = "Qwen/Qwen2.5-1.5B-Instruct"
-BLOCK     = 64          # weights per quantization block
-MAX_NEW   = 50          # tokens to generate in the demo
+# Quantisation mode — choose one:
+#   "mixed"    : outliers stored as float16 + bitmask per block (MixedQuantLinear)
+#   "pure_int8": 1 float16 scale + 64 int8 values per block, no outlier tracking (PureInt8Linear)
+QUANT_MODE    = "mixed"
 
 
-# ── Core quantization function ────────────────────────────────────────────────
-
-def quantize_int8_blockwise(
-    weight: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
+# ── Data structure ────────────────────────────────────────────────────────────
+@dataclass
+class MixedQuantWeight:
     """
-    Symmetric per-block int8 quantization.
+    Mixed INT8/FP16 quantised representation of a single weight tensor.
 
-    Each row is sliced into non-overlapping blocks of BLOCK elements.
-    One scale = max(|block|) / 127 is stored per block.
-
-    Args:
-        weight : float tensor  [N, K]   — original linear weight
-
-    Returns:
-        qweight : int8   tensor  [N, K]          — quantized weights
-        scales  : float16 tensor [N, K // BLOCK]  — per-block scales
+    CUDA kernel contract
+    --------------------
+    * int8_data and fp16_data are 1-D contiguous tensors.
+    * int8_offsets[b] and fp16_offsets[b] are the inclusive start indices in
+      int8_data / fp16_data for block b; the exclusive end is offsets[b+1].
+    * Within each block, values are stored in ascending position order so that
+      scatter / gather reduces to a single indexed write per value.
+    * Bit i of bitmask[b] (LSB = position 0) is 1 iff position i in block b
+      is stored as float16.  BLOCK_SIZE ≤ 64 keeps the mask in one int64 word.
     """
-    # Flatten any extra dims into K so quantization always operates on [N, K].
-    # e.g. a Conv weight [C_out, C_in, kH, kW] becomes [C_out, C_in*kH*kW].
-    if weight.dim() > 2:
-        weight = weight.view(weight.shape[0], -1)
+    int8_data:      torch.Tensor    # [total_int8_count]    int8
+    fp16_data:      torch.Tensor    # [total_fp16_count]    float16
+    bitmask:        torch.Tensor    # [num_blocks]          int64
+    scales:         torch.Tensor    # [num_blocks]          float16
+    int8_offsets:   torch.Tensor    # [num_blocks + 1]      int32
+    fp16_offsets:   torch.Tensor    # [num_blocks + 1]      int32
+    original_shape: tuple
 
-    N, K = weight.shape
-    assert K % BLOCK == 0, (
-        f"Weight K-dim ({K}) must be divisible by BLOCK ({BLOCK}). "
-        "Pad the linear layer before quantizing if needed."
+
+# ── Quantisation ──────────────────────────────────────────────────────────────
+def quantize_mixed(weight: torch.Tensor) -> MixedQuantWeight:
+    """
+    Quantise *weight* to mixed INT8/FP16 block format.
+
+    All arithmetic is done in float32 for precision; outputs are int8 / float16.
+    The operation is fully vectorised at the block level — no Python loops over
+    individual blocks.
+    """
+    flat = weight.detach().float().reshape(-1)
+
+    pad = (-flat.numel()) % BLOCK_SIZE
+    if pad:
+        flat = torch.cat([flat, flat.new_zeros(pad)])
+
+    num_blocks = flat.numel() // BLOCK_SIZE
+    blocks = flat.view(num_blocks, BLOCK_SIZE)          # [B, S]
+
+    # ── Outlier detection ─────────────────────────────────────────────────────
+    mu  = blocks.mean(dim=1, keepdim=True)              # [B, 1]
+    sig = blocks.std(dim=1,  keepdim=True).clamp(min=1e-8)
+    outlier_mask = (blocks - mu).abs() > OUTLIER_SIGMA * sig   # [B, S]  bool
+
+    # ── Build bitmasks (vectorised bit-shift + sum == OR for disjoint bits) ──
+    # bit_pos[i] = i, so (1 << bit_pos[i]) sets exactly bit i of the mask.
+    # Summing disjoint single-bit values equals OR even in int64 arithmetic.
+    bit_pos  = torch.arange(BLOCK_SIZE, dtype=torch.int64)     # [S]
+    bit_vals = outlier_mask.to(torch.int64) << bit_pos          # [B, S]
+    bitmasks = bit_vals.sum(dim=1)                              # [B]  int64
+
+    # ── Per-block scales (computed on non-outlier values only) ───────────────
+    safe_blocks = blocks.clone()
+    safe_blocks[outlier_mask] = 0.0
+    abs_max = safe_blocks.abs().amax(dim=1).clamp(min=1e-8)     # [B]
+    scales  = (abs_max / 127.0).to(torch.float16)               # [B]
+
+    # ── Quantise everything to int8; outlier slots get 0 (ignored on decode) ─
+    qblocks = (
+        blocks / abs_max.unsqueeze(1)
+    ).mul(127).round().clamp(-127, 127).to(torch.int8)          # [B, S]
+
+    # ── Pack into contiguous 1-D arrays (boolean indexing preserves order) ───
+    int8_data = qblocks[~outlier_mask]                          # [total_int8]   int8
+    fp16_data = blocks[outlier_mask].to(torch.float16)          # [total_fp16]  float16
+
+    int8_counts = (~outlier_mask).sum(dim=1).to(torch.int32)    # [B]
+    fp16_counts =   outlier_mask.sum(dim=1).to(torch.int32)     # [B]
+
+    int8_offsets = torch.zeros(num_blocks + 1, dtype=torch.int32)
+    fp16_offsets = torch.zeros(num_blocks + 1, dtype=torch.int32)
+    int8_offsets[1:] = int8_counts.cumsum(0)
+    fp16_offsets[1:] = fp16_counts.cumsum(0)
+
+    return MixedQuantWeight(
+        int8_data     = int8_data,
+        fp16_data     = fp16_data,
+        bitmask       = bitmasks,
+        scales        = scales,
+        int8_offsets  = int8_offsets,
+        fp16_offsets  = fp16_offsets,
+        original_shape= tuple(weight.shape),
     )
 
-    # Expose blocks: [N, K] -> [N, num_blocks, BLOCK]
-    w = weight.float().view(N, K // BLOCK, BLOCK)
 
-    # Per-block absolute max, clamped to avoid division by zero: [N, num_blocks]
-    scales = w.abs().amax(dim=2).clamp(min=1e-8)
-
-    # Divide by scale, multiply by 127, round, clamp to [-127, 127]
-    qweight = (
-        (w / scales.unsqueeze(2))
-        .mul(127)
-        .round()
-        .clamp(-127, 127)
-        .to(torch.int8)
-    )
-
-    return qweight.view(N, K), scales.to(torch.float16)
-
-
-# ── QuantLinear ───────────────────────────────────────────────────────────────
-
-class QuantLinear(nn.Module):
+# ── Dequantisation ────────────────────────────────────────────────────────────
+def dequantize_mixed(mqw: MixedQuantWeight) -> torch.Tensor:
     """
-    Drop-in replacement for nn.Linear.
+    Reconstruct a float16 weight tensor from *mqw*.
 
-    Weights are stored in int8 with per-block float16 scales.
-    Forward dequantizes one 64-column block at a time so that each
-    iteration is a proper [B, 64] @ [64, N] matmul — eliminating the
-    inner loop over N from the naive implementation.
-
-    Loop count per forward call: K // 64   (e.g. 64 for a 4096-wide layer)
-    vs naive:                    N * K // 64  (e.g. 262 144 for same layer)
+    The three steps below map directly to a CUDA kernel:
+      1. Expand each int64 bitmask to a per-position bool via vectorised shifts.
+      2. Compute the flat 1-D scatter index for every value (block_start + pos).
+      3. Scatter float16 outliers and dequantised int8 values in two writes.
     """
+    num_blocks = mqw.bitmask.numel()
+    device     = mqw.int8_data.device
 
-    BLOCK = 64
+    flat = torch.zeros(num_blocks * BLOCK_SIZE, dtype=torch.float16, device=device)
+
+    # ── Step 1 — expand bitmask → bool mask [B, S] ───────────────────────────
+    # Arithmetic right-shift of a signed int64 preserves the correct bit at
+    # every position including bit 63 (sign), because (mask >> i) & 1 always
+    # extracts bit i regardless of sign extension.
+    bit_pos   = torch.arange(BLOCK_SIZE, dtype=torch.int64, device=device)  # [S]
+    fp16_mask = ((mqw.bitmask.unsqueeze(1) >> bit_pos) & 1).bool()          # [B, S]
+    int8_mask = ~fp16_mask
+
+    # ── Step 2 — flat scatter positions ──────────────────────────────────────
+    block_starts = torch.arange(num_blocks, device=device).unsqueeze(1) * BLOCK_SIZE
+    all_pos  = block_starts + bit_pos           # [B, S]
+    fp16_pos = all_pos[fp16_mask]               # [total_fp16]
+    int8_pos = all_pos[int8_mask]               # [total_int8]
+
+    # ── Step 3 — scatter ──────────────────────────────────────────────────────
+    flat[fp16_pos] = mqw.fp16_data.to(device)
+
+    block_idx      = int8_mask.nonzero(as_tuple=False)[:, 0]       # [total_int8]
+    scales_per_val = mqw.scales[block_idx].to(device)              # [total_int8]
+    flat[int8_pos] = mqw.int8_data.to(torch.float16).to(device) * scales_per_val
+
+    # ── Trim padding, restore original shape ─────────────────────────────────
+    original_numel = 1
+    for s in mqw.original_shape:
+        original_numel *= s
+    return flat[:original_numel].reshape(mqw.original_shape)
+
+
+# ── Module ────────────────────────────────────────────────────────────────────
+class MixedQuantLinear(nn.Module):
+    """
+    Drop-in replacement for nn.Linear with mixed INT8/float16 weight storage.
+
+    Forward pass
+    ------------
+    1. Dequantise all weights back to float16  (dequantize_mixed).
+    2. Run the original F.linear with the reconstructed weight matrix.
+
+    All six quantised tensors are registered as buffers so that .to(device)
+    and state_dict() work transparently.
+    """
 
     def __init__(self, linear: nn.Linear) -> None:
         super().__init__()
 
-        qweight, scales = quantize_int8_blockwise(linear.weight.data)
+        mqw = quantize_mixed(linear.weight.data)
 
-        self.register_buffer("qweight", qweight)   # [N, K]          int8
-        self.register_buffer("scales",  scales)    # [N, K // BLOCK]  float16
+        self.register_buffer("int8_data",    mqw.int8_data)
+        self.register_buffer("fp16_data",    mqw.fp16_data)
+        self.register_buffer("bitmask",      mqw.bitmask)
+        self.register_buffer("scales",       mqw.scales)
+        self.register_buffer("int8_offsets", mqw.int8_offsets)
+        self.register_buffer("fp16_offsets", mqw.fp16_offsets)
+        self._weight_shape = tuple(linear.weight.data.shape)
 
         if linear.bias is not None:
             self.register_buffer("bias", linear.bias.data.clone())
@@ -108,154 +206,230 @@ class QuantLinear(nn.Module):
         self.in_features  = linear.in_features
         self.out_features = linear.out_features
 
-    # ── forward ───────────────────────────────────────────────────────────────
+    def _mqw(self) -> MixedQuantWeight:
+        return MixedQuantWeight(
+            int8_data     = self.int8_data,
+            fp16_data     = self.fp16_data,
+            bitmask       = self.bitmask,
+            scales        = self.scales,
+            int8_offsets  = self.int8_offsets,
+            fp16_offsets  = self.fp16_offsets,
+            original_shape= self._weight_shape,
+        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        orig_shape = x.shape
-
-        # LLaMA passes [batch, seq_len, hidden] — flatten to [B*S, K]
-        if x.dim() == 3:
-            x = x.view(-1, x.shape[-1])
-
-        B, K = x.shape
-        N    = self.qweight.shape[0]
-
-        out = torch.zeros(B, N, device=x.device, dtype=x.dtype)
-
-        for b in range(K // self.BLOCK):
-            start = b * self.BLOCK
-            end   = start + self.BLOCK
-
-            x_block = x[:, start:end]                           # [B,  64]
-            q_block = self.qweight[:, start:end]                # [N,  64]  int8
-            scale   = self.scales[:, b].to(x.dtype)            # [N]       float16
-
-            # Dequantize this block only:  [N, 64]
-            w_block = q_block.to(x.dtype) * scale.unsqueeze(1)
-
-            # Partial matmul and accumulate:  [B, 64] @ [64, N] → [B, N]
-            out += x_block @ w_block.T
-
-        if self.bias is not None:
-            out += self.bias
-
-        # Restore original leading dims for 3-D inputs
-        if len(orig_shape) == 3:
-            out = out.view(orig_shape[0], orig_shape[1], N)
-
-        return out
+        # Dequantise weights to float16 then run original linear forward.
+        weight = dequantize_mixed(self._mqw())
+        bias   = self.bias.to(weight.dtype) if self.bias is not None else None
+        return F.linear(x.to(weight.dtype), weight, bias)
 
     def extra_repr(self) -> str:
         return (
             f"in={self.in_features}, out={self.out_features}, "
-            f"bias={self.bias is not None}, block={self.BLOCK}"
+            f"bias={self.bias is not None}, "
+            f"block={BLOCK_SIZE}, sigma={OUTLIER_SIGMA}"
         )
 
 
-# ── Model surgery ─────────────────────────────────────────────────────────────
-
-def replace_linears(
-    model : nn.Module,
-    skip  : set[str] | None = None,
-) -> nn.Module:
+# ── Pure INT8 block quantisation (no outlier tracking) ───────────────────────
+def quantize_int8_block(weight: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     """
-    Walk the module tree and swap every nn.Linear for a QuantLinear.
+    Symmetric per-block int8 quantisation with no outlier tracking.
 
-    Args:
-        model : the model to patch in-place
-        skip  : attribute names to leave as nn.Linear.
-                Defaults to {"lm_head"} — the output projection maps
-                hidden → vocab and is quality-sensitive enough to skip.
+    Each row is padded to a multiple of BLOCK_SIZE then sliced into blocks.
+    One scale = max(|block|) / 127 is stored per block.
+
+    Returns
+    -------
+    qweight : int8   [N, K_padded]          — quantised weights
+    scales  : float16 [N, K_padded // BLOCK_SIZE] — per-block scales
     """
-    if skip is None:
-        skip = {"lm_head"}
+    if weight.dim() > 2:
+        weight = weight.reshape(weight.shape[0], -1)
 
-    for name, child in model.named_children():
-        if isinstance(child, nn.Linear) and name not in skip:
-            setattr(model, name, QuantLinear(child))
+    N, K = weight.shape
+    pad  = (-K) % BLOCK_SIZE
+    if pad:
+        weight = torch.cat([weight, weight.new_zeros(N, pad)], dim=1)
+    K_pad = weight.shape[1]
+
+    w      = weight.float().view(N, K_pad // BLOCK_SIZE, BLOCK_SIZE)   # [N, B, S]
+    scales = w.abs().amax(dim=2).clamp(min=1e-8)                       # [N, B]
+    qweight = (
+        (w / scales.unsqueeze(2)).mul(127).round().clamp(-127, 127).to(torch.int8)
+    )
+    return qweight.view(N, K_pad), scales.to(torch.float16)
+
+
+def dequantize_int8_block(
+    qweight: torch.Tensor,
+    scales: torch.Tensor,
+    original_shape: tuple,
+) -> torch.Tensor:
+    """
+    Reconstruct a float16 weight tensor from pure int8 block storage.
+    """
+    N, K_pad   = qweight.shape
+    num_blocks = K_pad // BLOCK_SIZE
+    w_fp16 = (
+        qweight.view(N, num_blocks, BLOCK_SIZE).to(torch.float16)
+        * scales.unsqueeze(2)
+    ).view(N, K_pad)
+
+    original_numel = 1
+    for s in original_shape:
+        original_numel *= s
+    return w_fp16.reshape(N, -1)[:, :original_numel // N].reshape(original_shape)
+
+
+class PureInt8Linear(nn.Module):
+    """
+    Drop-in replacement for nn.Linear — pure int8 block storage, no bitmask.
+
+    Storage per block of BLOCK_SIZE values: 1 float16 scale + BLOCK_SIZE int8 weights.
+    No outlier handling; outlier values are simply clipped to ±127 via the scale.
+
+    Forward pass
+    ------------
+    1. Dequantise all weights to float16 (dequantize_int8_block).
+    2. Run the original F.linear with the reconstructed weight matrix.
+    """
+
+    def __init__(self, linear: nn.Linear) -> None:
+        super().__init__()
+
+        qweight, scales = quantize_int8_block(linear.weight.data)
+        self.register_buffer("qweight", qweight)
+        self.register_buffer("scales",  scales)
+        self._weight_shape = tuple(linear.weight.data.shape)
+
+        if linear.bias is not None:
+            self.register_buffer("bias", linear.bias.data.clone())
         else:
-            replace_linears(child, skip)   # recurse into sub-modules
+            self.bias = None
+
+        self.in_features  = linear.in_features
+        self.out_features = linear.out_features
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Dequantise weights to float16 then run original linear forward.
+        weight = dequantize_int8_block(self.qweight, self.scales, self._weight_shape)
+        bias   = self.bias.to(weight.dtype) if self.bias is not None else None
+        return F.linear(x.to(weight.dtype), weight, bias)
+
+    def extra_repr(self) -> str:
+        return (
+            f"in={self.in_features}, out={self.out_features}, "
+            f"bias={self.bias is not None}, block={BLOCK_SIZE}"
+        )
+
+
+# ── Layer selection from file ─────────────────────────────────────────────────
+def load_layer_names(path: str) -> list[str]:
+    """
+    Read dot-separated layer paths from *path*, one per line.
+    Lines starting with '#' and blank lines are ignored.
+    """
+    names = []
+    with open(path) as fh:
+        for line in fh:
+            name = line.split("#")[0].strip()
+            if name:
+                names.append(name)
+    return names
+
+
+def quantize_selected_layers(model: nn.Module, layers_file: str) -> nn.Module:
+    """
+    Replace every nn.Linear listed in *layers_file* with a MixedQuantLinear.
+    Layers not in the file are left untouched.
+    """
+    names = load_layer_names(layers_file)
+    print(f"  Layers requested : {len(names)}")
+
+    for full_name in names:
+        parts       = full_name.split(".")
+        parent_path = ".".join(parts[:-1])
+        attr        = parts[-1]
+
+        try:
+            parent = model.get_submodule(parent_path) if parent_path else model
+            child  = getattr(parent, attr)
+        except (AttributeError, KeyError):
+            print(f"  [skip] {full_name}  — not found in model")
+            continue
+
+        if not isinstance(child, nn.Linear):
+            print(f"  [skip] {full_name}  — expected nn.Linear, got {type(child).__name__}")
+            continue
+
+        cls = MixedQuantLinear if QUANT_MODE == "mixed" else PureInt8Linear
+        setattr(parent, attr, cls(child))
+        print(f"  [done] {full_name}  ({QUANT_MODE})")
 
     return model
 
 
 # ── Utilities ─────────────────────────────────────────────────────────────────
-
 def model_size_mb(model: nn.Module) -> float:
-    """Total parameter + buffer storage in megabytes."""
     params  = sum(p.nelement() * p.element_size() for p in model.parameters())
     buffers = sum(b.nelement() * b.element_size() for b in model.buffers())
-    return (params + buffers) / (1024 ** 2)
+    return (params + buffers) / 1024 ** 2
 
 
 def count_layers(model: nn.Module) -> tuple[int, int]:
-    """Return (num_quantized_linears, num_total_linears)."""
     quant = total = 0
     for m in model.modules():
-        if isinstance(m, (nn.Linear, QuantLinear)):
+        if isinstance(m, (nn.Linear, MixedQuantLinear, PureInt8Linear)):
             total += 1
-            if isinstance(m, QuantLinear):
+            if isinstance(m, (MixedQuantLinear, PureInt8Linear)):
                 quant += 1
     return quant, total
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
-
 def main() -> None:
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Device : {device}\n")
 
-    # ── 1. Load pretrained model ──────────────────────────────────────────────
     print(f"Loading {MODEL_ID} ...")
     tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
     model = AutoModelForCausalLM.from_pretrained(
         MODEL_ID,
         torch_dtype=torch.float16,
-        low_cpu_mem_usage=True,   # stream weights in to avoid 2× peak RAM
+        low_cpu_mem_usage=True,
     )
     model.eval()
-
     size_fp16 = model_size_mb(model)
-    print(f"  Float16 size  : {size_fp16:,.0f} MB")
+    print(f"  Float16 size      : {size_fp16:,.1f} MB")
 
-    # ── 2. Quantize in-place ──────────────────────────────────────────────────
-    print(f"\nQuantizing (int8, block={BLOCK}) — skipping lm_head ...")
+    print(f"\nQuantizing layers from '{LAYERS_FILE}' ...")
     t0 = time.time()
     with torch.no_grad():
-        replace_linears(model)                     # skip={"lm_head"} default
+        quantize_selected_layers(model, LAYERS_FILE)
     dt = time.time() - t0
 
-    size_int8      = model_size_mb(model)
-    quant, total   = count_layers(model)
-    reduction      = size_fp16 / size_int8
+    size_mixed   = model_size_mb(model)
+    quant, total = count_layers(model)
+    print(f"  Done in           : {dt:.1f} s")
+    print(f"  Mixed-quant size  : {size_mixed:,.1f} MB  (was {size_fp16:,.1f} MB)")
+    print(f"  Layers quantised  : {quant} / {total}")
 
-    print(f"  Done in       : {dt:.1f}s")
-    print(f"  Int8 size     : {size_int8:,.0f} MB  ({reduction:.1f}× smaller)")
-    print(f"  Layers quant  : {quant} / {total}")
-
-    # ── 3. Move to inference device ───────────────────────────────────────────
     model = model.to(device)
 
-    # ── 4. Inference demo ─────────────────────────────────────────────────────
     prompt = "The meaning of life is"
     print(f"\nPrompt : {prompt!r}")
-
     inputs = tokenizer(prompt, return_tensors="pt").to(device)
 
     t0 = time.time()
     with torch.no_grad():
-        output_ids = model.generate(
-            **inputs,
-            max_new_tokens=MAX_NEW,
-            do_sample=False,
-        )
+        output_ids = model.generate(**inputs, max_new_tokens=MAX_NEW, do_sample=False)
     dt = time.time() - t0
 
     n_new   = output_ids.shape[1] - inputs["input_ids"].shape[1]
     decoded = tokenizer.decode(output_ids[0], skip_special_tokens=True)
-
     print(f"Output : {decoded!r}")
-    print(f"  {n_new} tokens in {dt:.2f}s  ({n_new / dt:.1f} tok/s)\n")
+    print(f"  {n_new} tokens in {dt:.2f} s  ({n_new / dt:.1f} tok/s)\n")
 
 
 if __name__ == "__main__":
