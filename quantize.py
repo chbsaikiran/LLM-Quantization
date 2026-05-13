@@ -28,7 +28,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 # ── Config ────────────────────────────────────────────────────────────────────
 MODEL_ID      = "Qwen/Qwen2.5-1.5B-Instruct"
-BLOCK_SIZE    = 64       # values per quantisation block  ← tweak here
+BLOCK_SIZE    = 512 # values per quantisation block  ← tweak here
 OUTLIER_SIGMA = 3.0      # positions beyond this many σ are kept as float16 (mixed mode only)
 MAX_NEW       = 50
 LAYERS_FILE   = "layers_to_quantize.txt"
@@ -53,11 +53,12 @@ class MixedQuantWeight:
     * Within each block, values are stored in ascending position order so that
       scatter / gather reduces to a single indexed write per value.
     * Bit i of bitmask[b] (LSB = position 0) is 1 iff position i in block b
-      is stored as float16.  BLOCK_SIZE ≤ 64 keeps the mask in one int64 word.
+      is stored as float16.  bitmask is [num_blocks, W] where
+      W = ceil(BLOCK_SIZE / 64); word w covers positions [w*64, (w+1)*64).
     """
-    int8_data:      torch.Tensor    # [total_int8_count]    int8
-    fp16_data:      torch.Tensor    # [total_fp16_count]    float16
-    bitmask:        torch.Tensor    # [num_blocks]          int64
+    int8_data:      torch.Tensor    # [total_int8_count]          int8
+    fp16_data:      torch.Tensor    # [total_fp16_count]          float16
+    bitmask:        torch.Tensor    # [num_blocks, ceil(S/64)]    int64
     scales:         torch.Tensor    # [num_blocks]          float16
     int8_offsets:   torch.Tensor    # [num_blocks + 1]      int32
     fp16_offsets:   torch.Tensor    # [num_blocks + 1]      int32
@@ -87,12 +88,16 @@ def quantize_mixed(weight: torch.Tensor) -> MixedQuantWeight:
     sig = blocks.std(dim=1,  keepdim=True).clamp(min=1e-8)
     outlier_mask = (blocks - mu).abs() > OUTLIER_SIGMA * sig   # [B, S]  bool
 
-    # ── Build bitmasks (vectorised bit-shift + sum == OR for disjoint bits) ──
-    # bit_pos[i] = i, so (1 << bit_pos[i]) sets exactly bit i of the mask.
-    # Summing disjoint single-bit values equals OR even in int64 arithmetic.
-    bit_pos  = torch.arange(BLOCK_SIZE, dtype=torch.int64)     # [S]
-    bit_vals = outlier_mask.to(torch.int64) << bit_pos          # [B, S]
-    bitmasks = bit_vals.sum(dim=1)                              # [B]  int64
+    # ── Build bitmasks — ceil(BLOCK_SIZE/64) int64 words per block ───────────
+    # Each word covers 64 positions; shifts stay within [0, 63] so no overflow.
+    num_words = max(1, (BLOCK_SIZE + 63) // 64)
+    bitmasks  = torch.zeros(num_blocks, num_words, dtype=torch.int64)
+    for w in range(num_words):
+        lo = w * 64
+        hi = min(lo + 64, BLOCK_SIZE)
+        local_pos        = torch.arange(hi - lo, dtype=torch.int64)
+        word_vals        = outlier_mask[:, lo:hi].to(torch.int64) << local_pos
+        bitmasks[:, w]   = word_vals.sum(dim=1)
 
     # ── Per-block scales (computed on non-outlier values only) ───────────────
     safe_blocks = blocks.clone()
@@ -138,24 +143,30 @@ def dequantize_mixed(mqw: MixedQuantWeight) -> torch.Tensor:
       2. Compute the flat 1-D scatter index for every value (block_start + pos).
       3. Scatter float16 outliers and dequantised int8 values in two writes.
     """
-    num_blocks = mqw.bitmask.numel()
+    num_blocks = mqw.bitmask.shape[0]
+    num_words  = mqw.bitmask.shape[1]
     device     = mqw.int8_data.device
 
     flat = torch.zeros(num_blocks * BLOCK_SIZE, dtype=torch.float16, device=device)
 
-    # ── Step 1 — expand bitmask → bool mask [B, S] ───────────────────────────
-    # Arithmetic right-shift of a signed int64 preserves the correct bit at
-    # every position including bit 63 (sign), because (mask >> i) & 1 always
-    # extracts bit i regardless of sign extension.
-    bit_pos   = torch.arange(BLOCK_SIZE, dtype=torch.int64, device=device)  # [S]
-    fp16_mask = ((mqw.bitmask.unsqueeze(1) >> bit_pos) & 1).bool()          # [B, S]
-    int8_mask = ~fp16_mask
+    # ── Step 1 — expand multi-word bitmask → bool mask [B, S] ────────────────
+    # Process each 64-bit word separately so shifts stay within [0, 63].
+    parts = []
+    for w in range(num_words):
+        lo = w * 64
+        hi = min(lo + 64, BLOCK_SIZE)
+        local_pos = torch.arange(hi - lo, dtype=torch.int64, device=device)
+        part = ((mqw.bitmask[:, w].unsqueeze(1) >> local_pos) & 1).bool()
+        parts.append(part)
+    fp16_mask = torch.cat(parts, dim=1)     # [B, S]
+    int8_mask  = ~fp16_mask
 
     # ── Step 2 — flat scatter positions ──────────────────────────────────────
+    pos_in_block = torch.arange(BLOCK_SIZE, device=device)
     block_starts = torch.arange(num_blocks, device=device).unsqueeze(1) * BLOCK_SIZE
-    all_pos  = block_starts + bit_pos           # [B, S]
-    fp16_pos = all_pos[fp16_mask]               # [total_fp16]
-    int8_pos = all_pos[int8_mask]               # [total_int8]
+    all_pos  = block_starts + pos_in_block  # [B, S]
+    fp16_pos = all_pos[fp16_mask]   # [total_fp16]
+    int8_pos = all_pos[int8_mask]   # [total_int8]
 
     # ── Step 3 — scatter ──────────────────────────────────────────────────────
     flat[fp16_pos] = mqw.fp16_data.to(device)
