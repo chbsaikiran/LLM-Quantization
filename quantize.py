@@ -18,6 +18,7 @@ Storage layout per block (CUDA-kernel friendly, CSR-style):
 Only layers listed in LAYERS_FILE are quantised; every other layer is unchanged.
 """
 
+import copy
 import time
 import torch
 import torch.nn as nn
@@ -28,7 +29,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 # ── Config ────────────────────────────────────────────────────────────────────
 MODEL_ID      = "Qwen/Qwen2.5-1.5B-Instruct"
-BLOCK_SIZE    = 512 # values per quantisation block  ← tweak here
+BLOCK_SIZE    = 2048 # values per quantisation block  ← tweak here
 OUTLIER_SIGMA = 3.0      # positions beyond this many σ are kept as float16 (mixed mode only)
 MAX_NEW       = 50
 LAYERS_FILE   = "layers_to_quantize.txt"
@@ -461,23 +462,53 @@ if USE_COMPILE:
     dequantize_int8_block = _c(dequantize_int8_block)
     _int8_fused_matmul    = _c(_int8_fused_matmul)
 
+def _first_non_meta_param_device(model: torch.nn.Module) -> torch.device:
+    for p in model.parameters():
+        if getattr(p, "device", None) is not None and str(p.device) != "meta":
+            return p.device
+    return torch.device("cpu")
+
+def _inputs_for_model(model: torch.nn.Module, tokenizer, text: str):
+    batch = tokenizer(text, return_tensors="pt")
+    device = _first_non_meta_param_device(model)
+    return batch.to(device)
+
+def compute_loss(model, tokenizer,text: str):
+    batch = _inputs_for_model(model,tokenizer, text)
+    with torch.no_grad():
+        outputs = model(**batch, labels=batch["input_ids"])
+    return outputs.loss.item()
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 def main() -> None:
+    texts = [
+    "Digital signal processing improves efficiency.",
+    "Quantization reduces model size."
+    ]
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Device : {device}\n")
 
     print(f"Loading {MODEL_ID} ...")
     tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
-    model = AutoModelForCausalLM.from_pretrained(
+    model_f16 = AutoModelForCausalLM.from_pretrained(
         MODEL_ID,
         torch_dtype=torch.float16,
         low_cpu_mem_usage=True,
     )
-    model.eval()
-    size_fp16 = model_size_mb(model)
+    model = copy.deepcopy(model_f16)
+    model_f16.eval()
+    
+    model_f16.to(device)
+    size_fp16 = model_size_mb(model_f16)
     print(f"  Float16 size      : {size_fp16:,.1f} MB")
+    loss_fp16 = compute_loss(model_f16,tokenizer, texts[0])
 
+    # Free GPU memory before loading the quantized model
+    model_f16.cpu()
+    del model_f16
+    torch.cuda.empty_cache()
+
+    model.eval()
     print(f"\nQuantizing layers from '{LAYERS_FILE}' ...")
     t0 = time.time()
     with torch.no_grad():
@@ -505,6 +536,10 @@ def main() -> None:
     decoded = tokenizer.decode(output_ids[0], skip_special_tokens=True)
     print(f"Output : {decoded!r}")
     print(f"  {n_new} tokens in {dt:.2f} s  ({n_new / dt:.1f} tok/s)\n")
+    loss_quant = compute_loss(model,tokenizer, texts[0])
+    print(f"  Float16 loss      : {loss_fp16:.4f}")
+    print(f"  Quant loss        : {loss_quant:.4f}")
+
 
 
 if __name__ == "__main__":
