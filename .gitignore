@@ -1,0 +1,51 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# Model weights & checkpoints
+*.bin
+*.pt
+*.pth
+*.safetensors
+*.gguf
+*.ckpt
+checkpoints/
+models/
+
+# HuggingFace cache
+.cache/
+
+# Generated outputs
+*.png
+*.jpg
+*.jpeg
+outputs/
+logs/
+
+# Duplicate / scratch files
+*\ (copy).*
+*_copy.*
+
+# torch.compile cache
+__triton_cache__/
+.triton/
+
+# OS
+.DS_Store
+Thumbs.db
