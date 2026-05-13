@@ -65,7 +65,7 @@ def simulate_int8_blockwise(weight: np.ndarray) -> np.ndarray:
 # ── Statistics ────────────────────────────────────────────────────────────────
 
 def print_stats(w: np.ndarray, layer_path: str) -> None:
-    p1, p25, p75, p99 = np.percentile(w, [1, 25, 75, 99])
+    p1, p25, p45, p50, p55, p75, p99 = np.percentile(w, [1, 25, 45, 50, 55, 75, 99])
     outlier_pct = (np.abs(w - w.mean()) > 3 * w.std()).mean() * 100
     print(f"\n{'─'*54}")
     print(f"  Layer    : {layer_path}")
@@ -75,6 +75,8 @@ def print_stats(w: np.ndarray, layer_path: str) -> None:
     print(f"  Min/Max  : {w.min():.6f} / {w.max():.6f}")
     print(f"  P1  /P99 : {p1:.6f} / {p99:.6f}")
     print(f"  P25 /P75 : {p25:.6f} / {p75:.6f}")
+    print(f"  P45 /P55 : {p45:.6f} / {p55:.6f}")
+    print(f"  P50      : {p50:.6f}")
     print(f"  Outliers (|w - mean| > 3sigma) : {outlier_pct:.2f}%")
     print(f"{'─'*54}")
 
