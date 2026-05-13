@@ -19,6 +19,7 @@ Only layers listed in LAYERS_FILE are quantised; every other layer is unchanged.
 """
 
 import copy
+import math
 import time
 import torch
 import torch.nn as nn
@@ -29,7 +30,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 # ── Config ────────────────────────────────────────────────────────────────────
 MODEL_ID      = "Qwen/Qwen2.5-1.5B-Instruct"
-BLOCK_SIZE    = 2048 # values per quantisation block  ← tweak here
+BLOCK_SIZE    = 1024 # values per quantisation block  ← tweak here
 OUTLIER_SIGMA = 3.0      # positions beyond this many σ are kept as float16 (mixed mode only)
 MAX_NEW       = 50
 LAYERS_FILE   = "layers_to_quantize.txt"
@@ -43,6 +44,11 @@ QUANT_MODE       = "mixed"
 USE_COMPILE      = True      # Plan B: wrap hot paths with torch.compile
 COMPILE_MODE     = "default" # "default" | "reduce-overhead" | "max-autotune"
 USE_FUSED_MATMUL = True      # Plan C: fused block matmul for PureInt8Linear
+
+# ── Companding (pure_int8 only) ───────────────────────────────────────────────
+COMPANDING = "mu_law"   # "none" | "mu_law" | "a_law"
+MU_LAW_MU  = 255.0    # μ parameter for mu-law
+A_LAW_A    = 87.6     # A parameter for A-law
 
 
 # ── Data structure ────────────────────────────────────────────────────────────
@@ -248,6 +254,40 @@ class MixedQuantLinear(nn.Module):
         )
 
 
+# ── Companding helpers (pure_int8 only) ──────────────────────────────────────
+def _compand(x: torch.Tensor) -> torch.Tensor:
+    """Map x ∈ [−1, 1] through the selected companding curve."""
+    if COMPANDING == "mu_law":
+        return x.sign() * (1.0 + MU_LAW_MU * x.abs()).log() / math.log(1.0 + MU_LAW_MU)
+    if COMPANDING == "a_law":
+        a     = A_LAW_A
+        denom = 1.0 + math.log(a)
+        abs_x = x.abs()
+        return x.sign() * torch.where(
+            abs_x < 1.0 / a,
+            a * abs_x / denom,
+            (1.0 + (a * abs_x).clamp(min=1e-8).log()) / denom,
+        )
+    return x  # "none"
+
+
+def _expand(y: torch.Tensor) -> torch.Tensor:
+    """Inverse of _compand; map y ∈ [−1, 1] back to the linear domain."""
+    if COMPANDING == "mu_law":
+        return y.sign() * ((1.0 + MU_LAW_MU) ** y.abs() - 1.0) / MU_LAW_MU
+    if COMPANDING == "a_law":
+        a         = A_LAW_A
+        denom     = 1.0 + math.log(a)
+        abs_y     = y.abs()
+        threshold = 1.0 / denom
+        return y.sign() * torch.where(
+            abs_y < threshold,
+            abs_y * denom / a,
+            (abs_y * denom - 1.0).exp() / a,
+        )
+    return y  # "none"
+
+
 # ── Pure INT8 block quantisation (no outlier tracking) ───────────────────────
 def quantize_int8_block(weight: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     """
@@ -271,10 +311,10 @@ def quantize_int8_block(weight: torch.Tensor) -> tuple[torch.Tensor, torch.Tenso
     K_pad = weight.shape[1]
 
     w      = weight.float().view(N, K_pad // BLOCK_SIZE, BLOCK_SIZE)   # [N, B, S]
-    scales = w.abs().amax(dim=2).clamp(min=1e-8)                       # [N, B]
-    qweight = (
-        (w / scales.unsqueeze(2)).mul(127).round().clamp(-127, 127).to(torch.int8)
-    )
+    scales = w.abs().amax(dim=2).clamp(min=1e-8)                       # [N, B]  absmax
+    w_norm = w / scales.unsqueeze(2)                                   # [N, B, S]  ∈ [−1, 1]
+    w_comp = _compand(w_norm)                                          # same shape, companded
+    qweight = w_comp.mul(127).round().clamp(-127, 127).to(torch.int8)
     return qweight.view(N, K_pad), scales.to(torch.float16)
 
 
@@ -288,10 +328,9 @@ def dequantize_int8_block(
     """
     N, K_pad   = qweight.shape
     num_blocks = K_pad // BLOCK_SIZE
-    w_fp16 = (
-        qweight.view(N, num_blocks, BLOCK_SIZE).to(torch.float16)
-        * scales.unsqueeze(2)
-    ).view(N, K_pad)
+    w_comp = qweight.view(N, num_blocks, BLOCK_SIZE).to(torch.float16) / 127.0  # ∈ [−1, 1]
+    w_norm = _expand(w_comp)                                                     # inverse compand
+    w_fp16 = (w_norm * scales.unsqueeze(2)).view(N, K_pad)
 
     original_numel = 1
     for s in original_shape:
@@ -336,8 +375,9 @@ def _int8_fused_matmul(
         * scales.unsqueeze(2)
     )                                                                # [N, nb, S]
 
-    # out[i, n] = Σ_b Σ_k  x[i,b,k] * w[n,b,k]  — fused by the compiler
-    out = torch.einsum("ibk,nbk->in", x_blocked, w_blocked)        # [B, N]
+    # out[i, n] = Σ_b Σ_k  x[i,b,k] * w[n,b,k]
+    # Cast to float32 for accumulation — float16 can overflow for long sequences.
+    out = torch.einsum("ibk,nbk->in", x_blocked.float(), w_blocked.float()).to(torch.float16)
 
     out = out.reshape(*x_shape[:-1], N)
     if bias is not None:
@@ -460,7 +500,8 @@ if USE_COMPILE:
     _c = lambda f: torch.compile(f, mode=COMPILE_MODE)
     dequantize_mixed      = _c(dequantize_mixed)
     dequantize_int8_block = _c(dequantize_int8_block)
-    _int8_fused_matmul    = _c(_int8_fused_matmul)
+    # dynamic=True: one compiled graph handles variable sequence lengths without recompiling each step
+    _int8_fused_matmul    = torch.compile(_int8_fused_matmul, mode=COMPILE_MODE, dynamic=True)
 
 def _first_non_meta_param_device(model: torch.nn.Module) -> torch.device:
     for p in model.parameters():
@@ -490,25 +531,15 @@ def main() -> None:
 
     print(f"Loading {MODEL_ID} ...")
     tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
-    model_f16 = AutoModelForCausalLM.from_pretrained(
+    model = AutoModelForCausalLM.from_pretrained(
         MODEL_ID,
         torch_dtype=torch.float16,
         low_cpu_mem_usage=True,
     )
-    model = copy.deepcopy(model_f16)
-    model_f16.eval()
-    
-    model_f16.to(device)
-    size_fp16 = model_size_mb(model_f16)
-    print(f"  Float16 size      : {size_fp16:,.1f} MB")
-    loss_fp16 = compute_loss(model_f16,tokenizer, texts[0])
-
-    # Free GPU memory before loading the quantized model
-    model_f16.cpu()
-    del model_f16
-    torch.cuda.empty_cache()
-
     model.eval()
+    size_fp16 = model_size_mb(model)
+    print(f"  Float16 size      : {size_fp16:,.1f} MB")
+
     print(f"\nQuantizing layers from '{LAYERS_FILE}' ...")
     t0 = time.time()
     with torch.no_grad():
@@ -537,7 +568,6 @@ def main() -> None:
     print(f"Output : {decoded!r}")
     print(f"  {n_new} tokens in {dt:.2f} s  ({n_new / dt:.1f} tok/s)\n")
     loss_quant = compute_loss(model,tokenizer, texts[0])
-    print(f"  Float16 loss      : {loss_fp16:.4f}")
     print(f"  Quant loss        : {loss_quant:.4f}")
 
 
